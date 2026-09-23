@@ -84,7 +84,7 @@ watch -n1 curl -s localhost:8000/instances
 # 故障期间路由自动避开 a；清除故障后 a 自动恢复参与调度
 curl -X POST localhost:8000/instances/a/fault -H 'content-type: application/json' -d '{"fail_next":0}'
 
-# 显式摘除（原因 manally_removed，不会被探测复活）
+# 显式摘除（原因 manually_removed，不会被探测复活）
 curl -X DELETE localhost:8000/instances/b
 
 # 查看熔断器状态
