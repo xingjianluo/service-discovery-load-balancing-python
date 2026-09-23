@@ -3,16 +3,23 @@ from __future__ import annotations
 
 import enum
 import threading
+import time
 
 
 class BreakerState(enum.Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
+    CLOSED = "closed"        # 正常放行
+    OPEN = "open"            # 熔断，拒绝调用
+    HALF_OPEN = "half_open"  # 冷却结束，放行一次试探
 
 
 class CircuitBreaker:
-    """每实例一个熔断器；打开时该实例不参与择路。"""
+    """每实例一个熔断器；打开时该实例不参与择路。
+
+    规则：
+    - CLOSED：连续失败达到阈值 -> OPEN。
+    - OPEN：冷却期内拒绝；冷却结束后进入 HALF_OPEN。
+    - HALF_OPEN：放行一次试探调用，成功 -> CLOSED，失败 -> 重新 OPEN。
+    """
 
     def __init__(self, failure_threshold: int = 3, cooldown_seconds: float = 5.0) -> None:
         self._lock = threading.Lock()
@@ -23,14 +30,30 @@ class CircuitBreaker:
         self._cooldown = cooldown_seconds
 
     def allow(self) -> bool:
-        raise NotImplementedError
+        with self._lock:
+            if self._state == BreakerState.CLOSED:
+                return True
+            if self._state == BreakerState.OPEN:
+                if time.monotonic() - self._opened_at >= self._cooldown:
+                    self._state = BreakerState.HALF_OPEN
+                    return True  # 放行一次试探
+                return False
+            return False  # HALF_OPEN 且已有试探在途
 
     def on_success(self) -> None:
-        raise NotImplementedError
+        with self._lock:
+            self._state = BreakerState.CLOSED
+            self._failures = 0
 
     def on_failure(self) -> None:
-        raise NotImplementedError
+        with self._lock:
+            self._failures += 1
+            if self._state == BreakerState.HALF_OPEN or \
+                    self._failures >= self._failure_threshold:
+                self._state = BreakerState.OPEN
+                self._opened_at = time.monotonic()
 
     @property
     def state(self) -> BreakerState:
-        raise NotImplementedError
+        with self._lock:
+            return self._state
