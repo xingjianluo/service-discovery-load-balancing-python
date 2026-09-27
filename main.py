@@ -44,6 +44,20 @@ class RegisterRequest(BaseModel):
     instance_id: str
     host: str = "127.0.0.1"
     port: int = 0
+    weight: int = 1
+    max_concurrency: int = 0  # 0 表示不限并发
+
+
+class WeightRequest(BaseModel):
+    weight: int
+
+
+class ConcurrencyRequest(BaseModel):
+    max_concurrency: int
+
+
+class DrainRequest(BaseModel):
+    drain_timeout: float = 30.0
 
 
 class FaultRequest(BaseModel):
@@ -55,9 +69,11 @@ class FaultRequest(BaseModel):
 @app.post("/instances")
 def register(req: RegisterRequest) -> dict:
     inst = Instance(req.instance_id, req.host, req.port or 9000 + len(upstreams))
-    registry.register(inst)
+    registry.register(inst, weight=req.weight,
+                      max_concurrency=req.max_concurrency)
     upstreams[inst.instance_id] = SimulatedUpstream(inst.instance_id)
-    return {"registered": inst.instance_id, "address": inst.address}
+    return {"registered": inst.instance_id, "address": inst.address,
+            "weight": req.weight, "max_concurrency": req.max_concurrency}
 
 
 @app.delete("/instances/{instance_id}")
@@ -67,8 +83,36 @@ def deregister(instance_id: str) -> dict:
 
 @app.get("/instances")
 def status() -> list[dict]:
-    """健康判定依据与当前状态（含可区分的不可用原因）。"""
+    """状态、不可用原因（含权重 0/排水/容量）、权重、容量、在途数。"""
+    registry.settle_drains()
     return registry.status()
+
+
+@app.post("/instances/{instance_id}/weight")
+def update_weight(instance_id: str, req: WeightRequest) -> dict:
+    """热调整权重：0 立即不接新请求，在途请求不受影响。"""
+    ok = registry.set_weight(instance_id, req.weight)
+    if not ok:
+        return {"error": "unknown instance"}
+    return {"instance_id": instance_id, "weight": req.weight}
+
+
+@app.post("/instances/{instance_id}/concurrency")
+def update_concurrency(instance_id: str, req: ConcurrencyRequest) -> dict:
+    """热调整实例级并发容量上限（0 表示不限）。"""
+    ok = registry.set_max_concurrency(instance_id, req.max_concurrency)
+    if not ok:
+        return {"error": "unknown instance"}
+    return {"instance_id": instance_id, "max_concurrency": req.max_concurrency}
+
+
+@app.post("/instances/{instance_id}/drain")
+def begin_drain(instance_id: str, req: DrainRequest) -> dict:
+    """优雅下线：进入排水，不接新请求；在途清零或超时后落地 drained。"""
+    ok = registry.begin_drain(instance_id, req.drain_timeout)
+    inst = registry.get(instance_id)
+    state = inst.state.value if inst else None
+    return {"instance_id": instance_id, "draining_started": ok, "state": state}
 
 
 @app.post("/instances/{instance_id}/fault")
