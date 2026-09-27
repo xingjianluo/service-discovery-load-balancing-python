@@ -28,12 +28,15 @@ class Router(abc.ABC):
 
 
 class RoundRobinRouter(Router):
-    """轮询：游标单调递增，对候选数取模，保证均匀且可预期。"""
+    """平滑加权轮询（nginx 风格）：每轮给各实例当前值加上权重，选最大者并减去总权重。
+
+    权重相同时退化为均匀轮询；权重变化立即生效，流量按比例平滑过渡。
+    """
 
     name = "round_robin"
 
     def __init__(self) -> None:
-        self._cursor = 0
+        self._current: dict[str, int] = {}  # instance_id -> 平滑轮询当前值
         self._lock = threading.Lock()
 
     def pick(self, candidates: list[Instance], key: str | None = None) -> RouteDecision:
@@ -41,29 +44,38 @@ class RoundRobinRouter(Router):
             return self._none(key)
         ordered = sorted(candidates, key=lambda i: i.instance_id)  # 稳定顺序
         with self._lock:
-            idx = self._cursor % len(ordered)
-            self._cursor += 1
-        chosen = ordered[idx]
-        return RouteDecision(key=key, instance_id=chosen.instance_id,
-                             strategy=self.name, reason=f"cursor slot {idx}")
+            live = {i.instance_id for i in ordered}
+            for stale in set(self._current) - live:
+                del self._current[stale]  # 清理已下线实例的游标状态
+            total = sum(i.weight for i in ordered)
+            best = ordered[0]
+            for inst in ordered:
+                cw = self._current.get(inst.instance_id, 0) + inst.weight
+                self._current[inst.instance_id] = cw
+                if cw > self._current[best.instance_id]:
+                    best = inst
+            self._current[best.instance_id] -= total
+        return RouteDecision(key=key, instance_id=best.instance_id,
+                             strategy=self.name,
+                             reason=f"smooth wrr weight={best.weight}")
 
 
 class LeastInflightRouter(Router):
-    """最少在途：选 inflight 最小者，并列时按 id 字典序保证确定性。"""
+    """加权最少在途：选 inflight/weight 最小者，并列时按 id 字典序保证确定性。"""
 
     name = "least_inflight"
 
     def pick(self, candidates: list[Instance], key: str | None = None) -> RouteDecision:
         if not candidates:
             return self._none(key)
-        chosen = min(candidates, key=lambda i: (i.inflight, i.instance_id))
+        chosen = min(candidates, key=lambda i: (i.inflight / i.weight, i.instance_id))
         return RouteDecision(key=key, instance_id=chosen.instance_id,
                              strategy=self.name,
-                             reason=f"inflight={chosen.inflight}")
+                             reason=f"inflight={chosen.inflight} weight={chosen.weight}")
 
 
 class ConsistentHashRouter(Router):
-    """按键一致性哈希：虚拟节点环，同键恒定落点，实例增减只影响少量键。"""
+    """按键加权一致性哈希：虚拟节点数与权重成正比，同键恒定落点，变更只影响少量键。"""
 
     name = "consistent_hash"
 
@@ -71,20 +83,20 @@ class ConsistentHashRouter(Router):
         self._replicas = replicas
         self._lock = threading.Lock()
         self._ring: list[tuple[int, str]] = []  # (hash, instance_id)，按 hash 有序
-        self._ring_key: tuple[str, ...] = ()    # 构建环时的实例集合指纹
+        self._ring_key: tuple[tuple[str, int], ...] = ()  # (实例, 权重) 集合指纹
 
     def _build_ring(self, candidates: list[Instance]) -> None:
-        ids = tuple(sorted(i.instance_id for i in candidates))
+        fingerprint = tuple(sorted((i.instance_id, i.weight) for i in candidates))
         with self._lock:
-            if ids == self._ring_key:
+            if fingerprint == self._ring_key:
                 return
             ring: list[tuple[int, str]] = []
-            for iid in ids:
-                for r in range(self._replicas):
+            for iid, weight in fingerprint:
+                for r in range(self._replicas * weight):
                     ring.append((_hash(f"{iid}#{r}"), iid))
             ring.sort()
             self._ring = ring
-            self._ring_key = ids
+            self._ring_key = fingerprint
 
     def pick(self, candidates: list[Instance], key: str | None = None) -> RouteDecision:
         if not candidates:

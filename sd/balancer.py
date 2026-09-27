@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import threading
 
-from .breaker import BreakerState, CircuitBreaker
+from .breaker import CircuitBreaker
 from .models import CallResult, FailureKind, RouteDecision
 from .registry import ServiceRegistry
 from .router import Router
@@ -52,30 +52,40 @@ class LoadBalancer:
             return br
 
     def _eligible(self) -> list:
-        """健康且熔断器放行的实例。"""
+        """健康（含权重>0）、熔断器放行且容量有余量的实例。"""
         return [i for i in self._registry.healthy_instances()
-                if self._breaker_for(i.instance_id).allow()]
+                if i.has_capacity() and self._breaker_for(i.instance_id).allow()]
+
+    def _no_candidate_detail(self) -> str:
+        """没有候选时给出可解释的原因。"""
+        healthy = self._registry.healthy_instances()
+        if healthy and all(not i.has_capacity() for i in healthy):
+            return "all instances at capacity (max_inflight reached)"
+        return "no eligible instance"
 
     def call(self, key: str | None = None) -> CallResult:
         last_kind: FailureKind | None = None
         last_detail = "no attempt"
         last_instance: str | None = None
+        excluded: set[str] = set()  # 本次调用中已失败/不可用的实例，重试必须换实例
 
         for attempt in range(1, self._max_retries + 2):  # 首次 + max_retries 次重试
-            candidates = self._eligible()
+            candidates = [i for i in self._eligible()
+                          if i.instance_id not in excluded]
             decision = self._router.pick(candidates, key)
             with self._lock:
                 self.decision_log.append(decision)
             if decision.instance_id is None:
-                logger.info("key=%s attempt=%d no eligible instance", key, attempt)
-                return CallResult(False, None, attempt, FailureKind.RETRYABLE,
-                                  "no eligible instance")
+                detail = self._no_candidate_detail()
+                logger.info("key=%s attempt=%d %s", key, attempt, detail)
+                return CallResult(False, None, attempt, FailureKind.RETRYABLE, detail)
             iid = decision.instance_id
             last_instance = iid
-            # acquire 与可用性检查原子完成；失败说明并发下实例刚被摘除，直接重选
+            # acquire 与可用性/容量检查原子完成；失败说明并发下实例刚被摘除或打满，换实例重选
             if not self._registry.acquire(iid):
                 logger.info("key=%s attempt=%d instance=%s became unavailable, re-pick",
                             key, attempt, iid)
+                excluded.add(iid)
                 continue
             try:
                 upstream = self._upstreams[iid]
@@ -90,6 +100,7 @@ class LoadBalancer:
                 return CallResult(True, iid, attempt, None, detail)
 
             breaker.on_failure()
+            excluded.add(iid)  # 可重试失败/超时：下一次尝试必须转移到其他实例
             last_kind, last_detail = kind, detail
             logger.info("key=%s attempt=%d instance=%s failed kind=%s detail=%s",
                         key, attempt, iid, kind.value if kind else "?", detail)

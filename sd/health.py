@@ -33,7 +33,9 @@ class HealthChecker:
         self._thread: threading.Thread | None = None
 
     def probe_once(self) -> None:
-        """执行一轮探测（同步，便于测试直接调用）。"""
+        """执行一轮探测（同步，便于测试直接调用）；同时推进排水超时落地。"""
+        for drained in self._registry.finalize_drains():
+            logger.info("drain finalized: instance=%s -> deregistered/drained", drained)
         for inst in self._registry.all_instances():
             upstream = self._upstreams.get(inst.instance_id)
             if upstream is None:

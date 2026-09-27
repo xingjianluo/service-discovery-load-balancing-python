@@ -44,6 +44,20 @@ class RegisterRequest(BaseModel):
     instance_id: str
     host: str = "127.0.0.1"
     port: int = 0
+    weight: int = 1
+    max_inflight: int = 0  # 0 表示不限并发
+
+
+class WeightRequest(BaseModel):
+    weight: int
+
+
+class CapacityRequest(BaseModel):
+    max_inflight: int  # 0 表示不限并发
+
+
+class DrainRequest(BaseModel):
+    timeout: float = 30.0  # 排水时限（秒）：在途清零或超时后落地为不可用
 
 
 class FaultRequest(BaseModel):
@@ -54,15 +68,35 @@ class FaultRequest(BaseModel):
 
 @app.post("/instances")
 def register(req: RegisterRequest) -> dict:
-    inst = Instance(req.instance_id, req.host, req.port or 9000 + len(upstreams))
+    inst = Instance(req.instance_id, req.host, req.port or 9000 + len(upstreams),
+                    weight=req.weight, max_inflight=req.max_inflight)
     registry.register(inst)
     upstreams[inst.instance_id] = SimulatedUpstream(inst.instance_id)
-    return {"registered": inst.instance_id, "address": inst.address}
+    return {"registered": inst.instance_id, "address": inst.address,
+            "weight": inst.weight, "max_inflight": inst.max_inflight}
 
 
 @app.delete("/instances/{instance_id}")
 def deregister(instance_id: str) -> dict:
     return {"deregistered": registry.deregister(instance_id)}
+
+
+@app.put("/instances/{instance_id}/weight")
+def set_weight(instance_id: str, req: WeightRequest) -> dict:
+    """热调整权重：立即生效；0 表示停止接新请求（在途不受影响）。"""
+    return {"updated": registry.set_weight(instance_id, req.weight)}
+
+
+@app.put("/instances/{instance_id}/capacity")
+def set_capacity(instance_id: str, req: CapacityRequest) -> dict:
+    """热调整并发容量上限。"""
+    return {"updated": registry.set_max_inflight(instance_id, req.max_inflight)}
+
+
+@app.post("/instances/{instance_id}/drain")
+def drain(instance_id: str, req: DrainRequest) -> dict:
+    """优雅下线：进入排水状态，在途清零或超时后落地为 deregistered/drained。"""
+    return {"draining": registry.begin_drain(instance_id, req.timeout)}
 
 
 @app.get("/instances")
