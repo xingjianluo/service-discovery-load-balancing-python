@@ -56,12 +56,27 @@ class LoadBalancer:
         return [i for i in self._registry.healthy_instances()
                 if i.has_capacity() and self._breaker_for(i.instance_id).allow()]
 
-    def _no_candidate_detail(self) -> str:
-        """没有候选时给出可解释的原因。"""
-        healthy = self._registry.healthy_instances()
+    def _no_candidate_detail(self, excluded: set[str] | None = None) -> str:
+        """没有候选时给出可解释的原因（只读，不触发熔断器状态迁移）。"""
+        excluded = excluded or set()
+        # 本次还没排除过的健康实例若全部打满，才是容量耗尽；
+        # 已被本次调用排除（失败/熔断）的实例不算在内。
+        healthy = [i for i in self._registry.healthy_instances()
+                   if i.instance_id not in excluded]
         if healthy and all(not i.has_capacity() for i in healthy):
             return "all instances at capacity (max_inflight reached)"
         return "no eligible instance"
+
+    def _classify_no_candidate(self, excluded: set[str]):
+        """无候选时的失败归类。
+
+        容量耗尽 -> CAPACITY_EXHAUSTED（不可重试，立即返回）；
+        其余（熔断打开/无健康实例/候选均已在本次重试中失败）-> RETRYABLE。
+        """
+        detail = self._no_candidate_detail(excluded)
+        if "at capacity" in detail:
+            return FailureKind.CAPACITY_EXHAUSTED, detail
+        return FailureKind.RETRYABLE, detail
 
     def call(self, key: str | None = None) -> CallResult:
         last_kind: FailureKind | None = None
@@ -76,16 +91,25 @@ class LoadBalancer:
             with self._lock:
                 self.decision_log.append(decision)
             if decision.instance_id is None:
-                detail = self._no_candidate_detail()
-                logger.info("key=%s attempt=%d %s", key, attempt, detail)
-                return CallResult(False, None, attempt, FailureKind.RETRYABLE, detail)
+                # 容量耗尽：立即以不可重试类型失败（不空等、不重试、不放大）；
+                # 其余无候选才按可重试处理。
+                kind, detail = self._classify_no_candidate(excluded)
+                logger.info("key=%s attempt=%d kind=%s %s",
+                            key, attempt, kind.value, detail)
+                return CallResult(False, None, attempt, kind, detail)
             iid = decision.instance_id
             last_instance = iid
             # acquire 与可用性/容量检查原子完成；失败说明并发下实例刚被摘除或打满，换实例重选
             if not self._registry.acquire(iid):
+                excluded.add(iid)
+                # 若其余（未被本次排除的）健康实例也都打满，立即以容量耗尽失败，
+                # 不多转一轮、不空等、不重试
+                kind, detail = self._classify_no_candidate(excluded)
+                if kind == FailureKind.CAPACITY_EXHAUSTED:
+                    logger.info("key=%s attempt=%d %s", key, attempt, detail)
+                    return CallResult(False, None, attempt, kind, detail)
                 logger.info("key=%s attempt=%d instance=%s became unavailable, re-pick",
                             key, attempt, iid)
-                excluded.add(iid)
                 continue
             try:
                 upstream = self._upstreams[iid]

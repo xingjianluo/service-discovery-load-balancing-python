@@ -10,7 +10,7 @@ import pytest
 
 from sd.balancer import LoadBalancer
 from sd.health import HealthChecker
-from sd.models import HealthState, Instance, UnavailableReason
+from sd.models import FailureKind, HealthState, Instance, UnavailableReason
 from sd.registry import ServiceRegistry
 from sd.router import ConsistentHashRouter, LeastInflightRouter, RoundRobinRouter
 from sd.simulator import SimulatedUpstream
@@ -249,11 +249,180 @@ class TestCapacityLimit:
         t.start()
         time.sleep(0.1)
         r = lb.call(key="cap-full")
-        logger.info("all at capacity: ok=%s detail=%s", r.ok, r.detail)
+        logger.info("all at capacity: ok=%s kind=%s detail=%s",
+                    r.ok, r.failure_kind, r.detail)
         assert not r.ok
         assert r.attempts == 1  # 尽快失败，不干等
         assert "at capacity" in r.detail
+        # 必须是明确的容量耗尽类型，不能被调用方当成可重试失败
+        assert r.failure_kind == FailureKind.CAPACITY_EXHAUSTED
+        assert r.instance_id is None  # 没有反复打到已打满的实例
+        # 容量耗尽不算实例失败：熔断器不得因此打开，在途计数不得漂移
+        assert lb.breaker_state("inst-a") == "closed"
+        assert reg.get("inst-a").inflight == 1
         t.join()
+        assert reg.get("inst-a").inflight == 0
+        assert reg.get("inst-a").reason == UnavailableReason.NONE
+
+    def test_capacity_full_is_reported_as_unavailable_reason(self):
+        """单实例打满：状态里原因必须是 capacity_full，有余量的实例不能误报。"""
+        reg, upstreams, lb = make_env(call_timeout=1.0)
+        reg.set_max_inflight("inst-a", 1)
+        upstreams["inst-a"].set_latency(0.3)
+        t = threading.Thread(target=lambda: lb.call(key="reason-hold"))
+        t.start()
+        time.sleep(0.1)
+        try:
+            status = {s["instance_id"]: s for s in reg.status()}
+            assert status["inst-a"]["at_capacity"] is True
+            assert status["inst-a"]["reason"] == "capacity_full"
+            assert status["inst-a"]["state"] == "healthy"
+            # 有余量的实例既不能挂容量标记，也不能报容量原因
+            for iid in ("inst-b", "inst-c"):
+                assert status[iid]["at_capacity"] is False
+                assert status[iid]["reason"] == "none"
+            inst = reg.get("inst-a")
+            assert inst.reason == UnavailableReason.CAPACITY_FULL
+            # 打满期间新流量被分流到有余量实例，不会进 inst-a
+            for n in range(4):
+                r = lb.call(key=f"reason-new-{n}")
+                assert r.ok and r.instance_id != "inst-a"
+        finally:
+            t.join()
+        # 在途归还后原因与计数一起恢复
+        inst = reg.get("inst-a")
+        assert inst.inflight == 0
+        assert inst.reason == UnavailableReason.NONE
+        assert {s["instance_id"]: s for s in reg.status()}["inst-a"]["reason"] == "none"
+
+    def test_capacity_hot_adjust_updates_reason(self):
+        """并发上限热调整：下调打满/上调放量/解除限制，原因同步更新。"""
+        reg, _upstreams, _lb = make_env()
+        reg.set_max_inflight("inst-b", 2)
+        assert reg.acquire("inst-b")
+        assert reg.get("inst-b").reason == UnavailableReason.NONE  # 1/2 有余量
+        assert reg.acquire("inst-b")
+        assert reg.get("inst-b").reason == UnavailableReason.CAPACITY_FULL  # 2/2 打满
+        # 上调上限立即恢复
+        assert reg.set_max_inflight("inst-b", 3)
+        assert reg.get("inst-b").reason == UnavailableReason.NONE
+        # 下调回打满立即剔除
+        reg.set_max_inflight("inst-b", 2)
+        assert reg.get("inst-b").reason == UnavailableReason.CAPACITY_FULL
+        # 0 表示不限并发，立即恢复
+        reg.set_max_inflight("inst-b", 0)
+        assert reg.get("inst-b").reason == UnavailableReason.NONE
+        assert reg.get("inst-b").has_capacity()
+        # 归还后计数归零，原因仍为 none
+        reg.release("inst-b")
+        reg.release("inst-b")
+        assert reg.get("inst-b").inflight == 0
+        assert reg.get("inst-b").reason == UnavailableReason.NONE
+
+    def test_capacity_reason_not_confused_with_weight_zero(self):
+        """权重 0 与容量满同时成立时展示 weight_zero；恢复权重后才可能是容量原因。"""
+        reg, _upstreams, _lb = make_env()
+        reg.set_max_inflight("inst-c", 1)
+        assert reg.acquire("inst-c")  # 打满
+        assert reg.get("inst-c").reason == UnavailableReason.CAPACITY_FULL
+        reg.set_weight("inst-c", 0)  # 同时权重为 0：以 weight_zero 展示
+        assert reg.get("inst-c").reason == UnavailableReason.WEIGHT_ZERO
+        reg.set_weight("inst-c", 1)  # 权重恢复但仍打满：回到 capacity_full
+        assert reg.get("inst-c").reason == UnavailableReason.CAPACITY_FULL
+        reg.release("inst-c")
+        assert reg.get("inst-c").reason == UnavailableReason.NONE
+
+    def test_capacity_reason_not_confused_with_health_and_drain(self):
+        """健康异常/排水等状态级原因优先于容量原因，且容量变化不覆盖它们。"""
+        reg, _upstreams, _lb = make_env()
+        reg.set_max_inflight("inst-a", 1)
+        assert reg.acquire("inst-a")  # 打满
+        assert reg.get("inst-a").reason == UnavailableReason.CAPACITY_FULL
+        # 探测失败达阈值：原因为 probe_failed，不能还显示容量原因
+        reg.record_probe_failure("inst-a")
+        reg.record_probe_failure("inst-a")
+        assert reg.get("inst-a").state == HealthState.UNHEALTHY
+        assert reg.get("inst-a").reason == UnavailableReason.PROBE_FAILED
+        # 容量热调整（即使解除限制）也不改写健康原因
+        reg.set_max_inflight("inst-a", 0)
+        assert reg.get("inst-a").reason == UnavailableReason.PROBE_FAILED
+        # 排水同理：draining/drained 优先
+        reg.release("inst-a")
+        reg.begin_drain("inst-b", timeout=30.0)  # 无在途，立即落地
+        assert reg.get("inst-b").state == HealthState.DEREGISTERED
+        assert reg.get("inst-b").reason == UnavailableReason.DRAINED
+        reg.set_max_inflight("inst-b", 1)
+        assert reg.get("inst-b").reason == UnavailableReason.DRAINED
+
+    def test_all_full_failure_does_not_trigger_retry_storm(self):
+        """全部打满时并发调用都立即返回容量耗尽，不产生任何上游调用放大。"""
+        reg, _upstreams, lb = make_env(max_retries=3)
+        for iid in IDS:
+            reg.set_max_inflight(iid, 1)
+            assert reg.acquire(iid)  # 每实例占满 1 个在途
+        try:
+            results = []
+            lock = threading.Lock()
+
+            def worker(n):
+                r = lb.call(key=f"storm-cap-{n}")
+                with lock:
+                    results.append(r)
+
+            threads = [threading.Thread(target=worker, args=(n,)) for n in range(24)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+            assert len(results) == 24
+            for r in results:
+                assert not r.ok
+                assert r.failure_kind == FailureKind.CAPACITY_EXHAUSTED
+                assert r.attempts == 1  # 不重试、不空等
+                assert r.instance_id is None
+            # 熔断器全部保持 closed，在途计数恰好为持有者占用的 1/实例
+            for iid in IDS:
+                assert lb.breaker_state(iid) == "closed"
+                assert reg.get(iid).inflight == 1
+        finally:
+            for iid in IDS:
+                reg.release(iid)
+        for iid in IDS:
+            assert reg.get(iid).inflight == 0
+            assert reg.get(iid).reason == UnavailableReason.NONE
+
+    def test_capacity_release_then_traffic_resumes(self):
+        """打满实例的在途归还后，原因清除且能立即重新接流量，不消耗重试。"""
+        reg, upstreams, lb = make_env(call_timeout=1.0)
+        reg.set_max_inflight("inst-a", 1)
+        upstreams["inst-a"].set_latency(0.3)
+        t = threading.Thread(target=lambda: lb.call(key="rel-hold"))
+        t.start()
+        time.sleep(0.1)
+        assert reg.get("inst-a").reason == UnavailableReason.CAPACITY_FULL
+        t.join()
+        assert reg.get("inst-a").reason == UnavailableReason.NONE
+        r = lb.call(key="rel-after")
+        assert r.ok and r.attempts == 1  # 恢复后正常一次成功，无重试漂移
+        assert lb.breaker_state("inst-a") == "closed"
+
+    @pytest.mark.parametrize("router", [
+        RoundRobinRouter(), LeastInflightRouter(), ConsistentHashRouter()])
+    def test_all_full_kind_consistent_across_strategies(self, router):
+        """三种策略下全部打满都返回 CAPACITY_EXHAUSTED 且只尝试 1 次。"""
+        reg, _upstreams, lb = make_env(router=router)
+        for iid in IDS:
+            reg.set_max_inflight(iid, 1)
+            assert reg.acquire(iid)
+        try:
+            r = lb.call(key="cap-strategy")
+            assert not r.ok
+            assert r.failure_kind == FailureKind.CAPACITY_EXHAUSTED
+            assert r.attempts == 1
+            assert r.instance_id is None
+        finally:
+            for iid in IDS:
+                reg.release(iid)
 
     def test_no_oversubscription_under_concurrency(self):
         reg, upstreams, lb = make_env()

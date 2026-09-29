@@ -34,6 +34,7 @@ class FailureKind(enum.Enum):
     RETRYABLE = "retryable"      # 可重试（如 502/503、连接错误）
     TIMEOUT = "timeout"          # 超时，可重试
     NON_RETRYABLE = "non_retryable"  # 不可重试（如 400）
+    CAPACITY_EXHAUSTED = "capacity_exhausted"  # 所有实例并发容量均打满；立即失败，调用方不应重试
 
 
 @dataclass

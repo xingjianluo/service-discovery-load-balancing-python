@@ -18,11 +18,10 @@ class ServiceRegistry:
     def register(self, instance: Instance) -> None:
         with self._lock:
             instance.state = HealthState.HEALTHY
-            instance.reason = (UnavailableReason.WEIGHT_ZERO if instance.weight <= 0
-                               else UnavailableReason.NONE)
             instance.consecutive_failures = 0
             instance.drain_deadline = None
             self._instances[instance.instance_id] = instance
+            self._recompute_reason(instance)
 
     def deregister(self, instance_id: str) -> bool:
         with self._lock:
@@ -42,10 +41,7 @@ class ServiceRegistry:
                 return False
             inst.weight = weight
             if inst.state == HealthState.HEALTHY:
-                if weight == 0 and inst.reason == UnavailableReason.NONE:
-                    inst.reason = UnavailableReason.WEIGHT_ZERO
-                elif weight > 0 and inst.reason == UnavailableReason.WEIGHT_ZERO:
-                    inst.reason = UnavailableReason.NONE
+                self._recompute_reason(inst)  # 权重变化可能切换 weight_zero/capacity_full/none
             return True
 
     def set_max_inflight(self, instance_id: str, max_inflight: int) -> bool:
@@ -55,6 +51,8 @@ class ServiceRegistry:
             if inst is None or max_inflight < 0:
                 return False
             inst.max_inflight = max_inflight
+            if inst.state == HealthState.HEALTHY:
+                self._recompute_reason(inst)  # 上限下调打满 -> capacity_full；上调/解除 -> 恢复
             return True
 
     def begin_drain(self, instance_id: str, timeout: float = 30.0) -> bool:
@@ -96,6 +94,30 @@ class ServiceRegistry:
         inst.reason = UnavailableReason.DRAINED
         inst.drain_deadline = None
 
+    def _recompute_reason(self, inst: Instance) -> None:
+        """按优先级重算实例的不可用原因（调用方须持锁）。
+
+        摘除/排水/健康异常等"状态级"原因优先；仅在 healthy 时，
+        才在 weight_zero 与 capacity_full 之间收敛，容量原因不会与
+        其他原因互相覆盖或混淆。
+        """
+        # manually_removed / drained 由状态迁移决定，容量变化不改写
+        if inst.state == HealthState.DEREGISTERED:
+            return
+        if inst.state == HealthState.DRAINING:
+            inst.reason = UnavailableReason.DRAINING
+            return
+        if inst.state == HealthState.UNHEALTHY:
+            inst.reason = UnavailableReason.PROBE_FAILED
+            return
+        # HEALTHY：权重为 0 优先于容量原因（两者可同时成立，但只展示最直接的）
+        if inst.weight <= 0:
+            inst.reason = UnavailableReason.WEIGHT_ZERO
+        elif not inst.has_capacity():
+            inst.reason = UnavailableReason.CAPACITY_FULL
+        else:
+            inst.reason = UnavailableReason.NONE
+
     def get(self, instance_id: str) -> Instance | None:
         with self._lock:
             return self._instances.get(instance_id)
@@ -116,8 +138,7 @@ class ServiceRegistry:
                 return  # 已摘除/排水中的实例不因探测成功而复活
             inst.consecutive_failures = 0
             inst.state = HealthState.HEALTHY
-            inst.reason = (UnavailableReason.WEIGHT_ZERO if inst.weight <= 0
-                           else UnavailableReason.NONE)
+            self._recompute_reason(inst)  # 恢复后可能仍因权重 0/容量满而不可调度
 
     def record_probe_failure(self, instance_id: str) -> None:
         with self._lock:
@@ -137,6 +158,8 @@ class ServiceRegistry:
             if inst is None or not inst.is_available() or not inst.has_capacity():
                 return False
             inst.inflight += 1
+            if inst.state == HealthState.HEALTHY and not inst.has_capacity():
+                inst.reason = UnavailableReason.CAPACITY_FULL
             return True
 
     def release(self, instance_id: str) -> None:
@@ -148,6 +171,9 @@ class ServiceRegistry:
             inst.inflight -= 1
             if inst.state == HealthState.DRAINING and inst.inflight == 0:
                 self._finalize_drain(inst)
+            elif inst.state == HealthState.HEALTHY:
+                # 有余量 -> 原因恢复（或收敛为期间变化的 weight_zero）；仍满则保持 capacity_full
+                self._recompute_reason(inst)
 
     def status(self) -> list[dict]:
         """返回每个实例的健康判定依据、权重、容量与排水进度。"""
