@@ -9,8 +9,9 @@ from collections import Counter
 import pytest
 
 from sd.balancer import LoadBalancer
+from sd.breaker import BreakerState
 from sd.health import HealthChecker
-from sd.models import HealthState, Instance, UnavailableReason
+from sd.models import FailureKind, HealthState, Instance, UnavailableReason
 from sd.registry import ServiceRegistry
 from sd.router import ConsistentHashRouter, LeastInflightRouter, RoundRobinRouter
 from sd.simulator import SimulatedUpstream
@@ -248,12 +249,27 @@ class TestCapacityLimit:
         t = threading.Thread(target=lambda: lb.call(key="cap-hold"))
         t.start()
         time.sleep(0.1)
+        status = {s["instance_id"]: s for s in reg.status()}
+        assert status["inst-a"]["reason"] == "capacity_full"
+        assert status["inst-a"]["state"] == "healthy"  # 打满是瞬态，不改健康状态
+        started = time.monotonic()
         r = lb.call(key="cap-full")
-        logger.info("all at capacity: ok=%s detail=%s", r.ok, r.detail)
+        elapsed = time.monotonic() - started
+        logger.info("all at capacity: ok=%s kind=%s detail=%s elapsed=%.3f",
+                    r.ok, r.failure_kind, r.detail, elapsed)
         assert not r.ok
         assert r.attempts == 1  # 尽快失败，不干等
+        assert r.failure_kind == FailureKind.CAPACITY_EXHAUSTED  # 不再被归成可重试
         assert "at capacity" in r.detail
+        assert elapsed < 0.05  # 不排队空等
+        assert upstreams["inst-a"].calls == 1  # 容量耗尽的失败不重复打到打满实例
+        assert lb.breaker_state("inst-a") == BreakerState.CLOSED.value  # 熔断不漂移
         t.join()
+        # 在途归还后原因立刻恢复正常
+        status = {s["instance_id"]: s for s in reg.status()}
+        assert status["inst-a"]["reason"] == "none"
+        assert status["inst-a"]["inflight"] == 0
+        assert reg.get("inst-a").reason == UnavailableReason.NONE  # 持久原因从未被写脏
 
     def test_no_oversubscription_under_concurrency(self):
         reg, upstreams, lb = make_env()
@@ -292,6 +308,136 @@ class TestCapacityLimit:
             assert r.ok or "at capacity" in r.detail
         for iid in IDS:
             assert reg.get(iid).inflight == 0  # 在途计数无漂移
+
+
+class TestCapacityReasonConsistency:
+    """容量打满/释放/热调整边界上：状态原因与实际可接流能力严格一致。"""
+
+    @staticmethod
+    def _reasons(reg):
+        return {s["instance_id"]: s["reason"] for s in reg.status()}
+
+    def test_single_full_reason_then_release_clears(self):
+        reg, _upstreams, _lb = make_env()
+        reg.set_max_inflight("inst-a", 1)
+        assert reg.acquire("inst-a")
+        reasons = self._reasons(reg)
+        assert reasons == {"inst-a": "capacity_full",
+                           "inst-b": "none", "inst-c": "none"}
+        # 有余量的实例不能报容量原因，打满的实例不能显示正常
+        assert reg.get("inst-a").reason == UnavailableReason.NONE  # 瞬态不写回持久字段
+        assert not reg.get("inst-a").has_capacity()
+        assert reg.get("inst-b").effective_reason() == UnavailableReason.NONE
+        assert not reg.acquire("inst-a")  # 实际已不能再接新流量
+        reg.release("inst-a")
+        assert self._reasons(reg) == {iid: "none" for iid in IDS}
+        assert reg.get("inst-a").inflight == 0
+        assert reg.acquire("inst-a")  # 归还后立刻可接
+        reg.release("inst-a")
+
+    def test_all_full_returns_capacity_exhausted_without_retry_amplification(self):
+        reg, upstreams, lb = make_env(max_retries=3, call_timeout=1.0)
+        for iid in IDS:
+            reg.set_max_inflight(iid, 1)
+            upstreams[iid].set_latency(0.3)
+        holders = [threading.Thread(target=lambda k=iid: lb.call(key=f"hold-{k}"))
+                   for iid in IDS]
+        for t in holders:
+            t.start()
+        time.sleep(0.12)
+        assert all(s["reason"] == "capacity_full" for s in reg.status())
+        calls_before = {iid: upstreams[iid].calls for iid in IDS}
+
+        r = lb.call(key="exhausted")
+        assert not r.ok
+        assert r.failure_kind == FailureKind.CAPACITY_EXHAUSTED
+        assert r.attempts == 1  # 不重试、不空等
+        assert r.instance_id is None
+        # 没有任何上游被这次失败额外调用 -> 不会放大成重试风暴
+        assert {iid: upstreams[iid].calls for iid in IDS} == calls_before
+        for iid in IDS:  # 熔断状态不漂移
+            assert lb.breaker_state(iid) == BreakerState.CLOSED.value
+        for t in holders:
+            t.join()
+        assert self._reasons(reg) == {iid: "none" for iid in IDS}
+
+    def test_capacity_hot_adjust_updates_reason_immediately(self):
+        reg, _upstreams, _lb = make_env()
+        reg.set_max_inflight("inst-a", 2)
+        assert reg.acquire("inst-a")
+        assert reg.acquire("inst-a")  # inflight=2，打满
+        reasons = self._reasons(reg)
+        assert reasons["inst-a"] == "capacity_full"
+
+        reg.set_max_inflight("inst-a", 3)  # 热调大：2 < 3，立刻有余量
+        assert self._reasons(reg)["inst-a"] == "none"
+        assert reg.get("inst-a").has_capacity()
+
+        reg.set_max_inflight("inst-a", 2)  # 热调小到当前在途：再次打满
+        assert self._reasons(reg)["inst-a"] == "capacity_full"
+        assert not reg.acquire("inst-a")
+
+        reg.set_max_inflight("inst-a", 0)  # 0=不限：立刻恢复
+        assert self._reasons(reg)["inst-a"] == "none"
+        assert reg.acquire("inst-a")
+        reg.release("inst-a")
+        reg.release("inst-a")
+        reg.release("inst-a")
+        assert reg.get("inst-a").inflight == 0
+        assert self._reasons(reg)["inst-a"] == "none"
+
+    def test_capacity_reason_does_not_mask_other_causes(self):
+        reg, _upstreams, _lb = make_env()
+        # 权重 0 + 恰好打满（人为持有在途）：优先展示 weight_zero
+        reg.set_max_inflight("inst-b", 1)
+        assert reg.acquire("inst-b")
+        reg.set_weight("inst-b", 0)
+        assert self._reasons(reg)["inst-b"] == "weight_zero"
+
+        # 排水中 + 打满：优先展示 draining
+        reg.set_max_inflight("inst-c", 1)
+        assert reg.acquire("inst-c")
+        reg.begin_drain("inst-c", timeout=30.0)
+        assert self._reasons(reg)["inst-c"] == "draining"
+
+        # 健康异常 + 打满：优先展示 probe_failed
+        reg.set_max_inflight("inst-a", 1)
+        assert reg.acquire("inst-a")
+        reg.record_probe_failure("inst-a")
+        reg.record_probe_failure("inst-a")
+        assert reg.get("inst-a").state == HealthState.UNHEALTHY
+        assert self._reasons(reg)["inst-a"] == "probe_failed"
+
+    def test_release_after_drain_keeps_reason_and_counts_consistent(self):
+        reg, _upstreams, _lb = make_env()
+        reg.set_max_inflight("inst-a", 1)
+        assert reg.acquire("inst-a")  # 打满
+        assert self._reasons(reg)["inst-a"] == "capacity_full"
+        reg.begin_drain("inst-a", timeout=30.0)
+        assert self._reasons(reg)["inst-a"] == "draining"
+        reg.release("inst-a")  # 在途归还 -> 排水立即落地
+        inst = reg.get("inst-a")
+        assert inst.state == HealthState.DEREGISTERED
+        assert inst.reason == UnavailableReason.DRAINED
+        assert inst.inflight == 0
+        assert self._reasons(reg)["inst-a"] == "drained"
+
+    def test_capacity_release_during_call_allows_next_call(self):
+        reg, upstreams, lb = make_env(call_timeout=1.0)
+        reg.set_max_inflight("inst-a", 1)
+        upstreams["inst-a"].set_latency(0.2)
+        t = threading.Thread(target=lambda: lb.call(key="hold"))
+        t.start()
+        time.sleep(0.1)
+        assert self._reasons(reg)["inst-a"] == "capacity_full"
+        r = lb.call(key="while-full")
+        assert r.ok and r.instance_id != "inst-a"  # 打满期间分流到其他实例
+        t.join()
+        time.sleep(0.02)
+        assert self._reasons(reg)["inst-a"] == "none"
+        seen = {lb.call(key=f"back-{n}").instance_id for n in range(6)}
+        assert "inst-a" in seen  # 容量释放后重新参与调度，计数/原因一致
+        assert reg.get("inst-a").inflight == 0
 
 
 class TestFailoverSwitchesInstance:

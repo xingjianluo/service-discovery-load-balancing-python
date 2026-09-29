@@ -40,6 +40,19 @@ class CircuitBreaker:
                 return False
             return False  # HALF_OPEN 且已有试探在途
 
+    def would_allow(self) -> bool:
+        """与 allow() 同样的放行判定，但不推进熔断器状态。
+
+        供“无候选”原因归类使用：不能因为一次查询把 OPEN 提前翻成 HALF_OPEN、
+        抢占唯一的试探名额。
+        """
+        with self._lock:
+            if self._state == BreakerState.CLOSED:
+                return True
+            if self._state == BreakerState.OPEN:
+                return time.monotonic() - self._opened_at >= self._cooldown
+            return False
+
     def on_success(self) -> None:
         with self._lock:
             self._state = BreakerState.CLOSED

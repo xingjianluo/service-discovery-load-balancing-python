@@ -56,12 +56,23 @@ class LoadBalancer:
         return [i for i in self._registry.healthy_instances()
                 if i.has_capacity() and self._breaker_for(i.instance_id).allow()]
 
-    def _no_candidate_detail(self) -> str:
-        """没有候选时给出可解释的原因。"""
+    def _no_candidate_outcome(self) -> tuple[FailureKind, str]:
+        """没有候选时给出可解释、可区分的失败归类。
+
+        - 全部健康且熔断放行的实例都打满并发 -> CAPACITY_EXHAUSTED：
+          立即失败，不换实例重试、不空等，调用方退避后再试即可避免风暴。
+        - 其余情况（健康异常/权重 0/排水/熔断打开等）-> RETRYABLE。
+        判定只读取熔断器状态（would_allow），不推进 half-open 试探。
+        """
         healthy = self._registry.healthy_instances()
-        if healthy and all(not i.has_capacity() for i in healthy):
-            return "all instances at capacity (max_inflight reached)"
-        return "no eligible instance"
+        if healthy:
+            breaker_open = [i for i in healthy
+                            if not self._breaker_for(i.instance_id).would_allow()]
+            at_capacity = [i for i in healthy if not i.has_capacity()]
+            if not breaker_open and len(at_capacity) == len(healthy):
+                return (FailureKind.CAPACITY_EXHAUSTED,
+                        "all instances at capacity (max_inflight reached)")
+        return FailureKind.RETRYABLE, "no eligible instance"
 
     def call(self, key: str | None = None) -> CallResult:
         last_kind: FailureKind | None = None
@@ -76,9 +87,10 @@ class LoadBalancer:
             with self._lock:
                 self.decision_log.append(decision)
             if decision.instance_id is None:
-                detail = self._no_candidate_detail()
-                logger.info("key=%s attempt=%d %s", key, attempt, detail)
-                return CallResult(False, None, attempt, FailureKind.RETRYABLE, detail)
+                kind, detail = self._no_candidate_outcome()
+                logger.info("key=%s attempt=%d kind=%s %s",
+                            key, attempt, kind.value, detail)
+                return CallResult(False, None, attempt, kind, detail)
             iid = decision.instance_id
             last_instance = iid
             # acquire 与可用性/容量检查原子完成；失败说明并发下实例刚被摘除或打满，换实例重选

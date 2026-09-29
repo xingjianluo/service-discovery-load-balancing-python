@@ -52,9 +52,22 @@ tests/          pytest 测试（摘除恢复、键亲和、并发重试、权重
 ## 实例级并发容量保护
 
 - 注册时 `max_inflight`（或 `PUT /instances/{id}/capacity`）设置每实例最大并发，`0` 表示不限（默认）。
-- 择路候选自动排除已达上限的实例（`status.at_capacity=true`，对应不可用原因 `capacity_full`），请求分流到其他有余量的实例。
+- 择路候选自动排除已达上限的实例，请求分流到其他有余量的实例。
+- **状态查询里容量打满是明确的不可用原因**：健康实例在途达到上限时
+  `GET /instances` 直接返回 `reason=capacity_full`（同时 `at_capacity=true`、
+  `state` 仍为 `healthy`），不再只看到一个容量标记却显示"正常"。该原因是按
+  当前在途/上限**实时派生**的，不写回实例持久原因，因此：
+  - 在途请求归还（`release`）后立刻恢复成 `reason=none`，可重新接流；
+  - 热调大/调小上限（或设回 `0` 不限）后原因同步更新，无需重启；
+  - 健康异常（`probe_failed`）、权重为 0（`weight_zero`）、排水（`draining`/`drained`）、
+    硬摘除（`manually_removed`）等持久原因优先展示，绝不与容量原因互相覆盖或混淆。
 - 容量检查与在途 `+1` 在注册表同一把锁内原子完成，并发压力下绝不超发（测试断言：32 线程、每实例容量 2，观测到的峰值在途 ≤ 2）。
-- 所有实例都到上限时，请求**立即失败返回**（不排队、不空转、不会堆到同一实例），`detail="all instances at capacity (max_inflight reached)"`。
+- **所有可用实例都到上限时，请求立即失败返回**（不排队、不空转、不会反复打到同一实例、
+  不做任何重试），失败类型为专门的 `failure_kind=capacity_exhausted`
+  （`detail="all instances at capacity (max_inflight reached)"`），而**不是**
+  `retryable`：调用方据此做降级/退避，避免把瞬时容量耗尽放大成重试风暴。
+  熔断打开、健康异常等其它"无候选"情况仍归 `retryable`。容量耗尽的失败不触碰任何
+  上游、不改变熔断器状态、不消耗重试次数（`attempts=1`），在途归还后原因与计数同时归位。
 
 **不可用原因对照**（`reason` 字段）：
 
@@ -87,6 +100,8 @@ tests/          pytest 测试（摘除恢复、键亲和、并发重试、权重
 **重试约束（避免重试风暴）**：
 
 - 仅 `retryable`（模拟 503）与 `timeout` 失败会转移重试，`non_retryable` 立即返回。
+- `capacity_exhausted`（全部实例并发打满）**不重试**：立即返回且不触碰任何实例，
+  调用方应退避/降级，从根上避免重试风暴。
 - **每次重试强制换到另一个实例**：本次调用已失败（或已打满/已摘除）的实例记入排除集，三种策略都不会反复重试同一个坏实例（测试覆盖三种策略的 503 与超时转移）。
 - 重试上限 `max_retries`（默认 2，即最多 3 次尝试），超出即返回 `retries exhausted`；实例数不足时提前结束。
 - 熔断打开的实例直接排除在候选之外，重试不会放大对故障实例的调用量。
@@ -125,6 +140,25 @@ curl -X PUT localhost:8000/instances/a/weight -H 'content-type: application/json
 # 热调整并发容量上限
 curl -X PUT localhost:8000/instances/b/capacity -H 'content-type: application/json' -d '{"max_inflight":2}'
 
+# —— 复现“容量打满”边界 ——
+# 1) 只留 a、b 两个实例并把各自并发上限设为 1，再让调用挂住（latency 超过 0.5s 超时）
+curl -X DELETE localhost:8000/instances/c
+curl -X PUT localhost:8000/instances/a/capacity -H 'content-type: application/json' -d '{"max_inflight":1}'
+curl -X PUT localhost:8000/instances/b/capacity -H 'content-type: application/json' -d '{"max_inflight":1}'
+curl -X POST localhost:8000/instances/a/fault -H 'content-type: application/json' -d '{"latency":2}'
+curl -X POST localhost:8000/instances/b/fault -H 'content-type: application/json' -d '{"latency":2}'
+# 2) 先后各发起一个占用在途的慢调用（后台挂起），此时 a、b 都打满
+curl 'localhost:8000/route?key=hold-a&strategy=round_robin' &
+curl 'localhost:8000/route?key=hold-b&strategy=round_robin' &
+sleep 1
+# 3) 状态查询：a、b 的 reason 明确为 capacity_full（state 仍是 healthy）
+curl -s localhost:8000/instances | python3 -m json.tool
+# 4) 再来一个调用：立即返回 failure_kind=capacity_exhausted、attempts=1（非 retryable，不重试不空等）
+curl 'localhost:8000/route?key=overflow&strategy=round_robin'
+# 5) 等慢调用超时归还（约 0.5s 后），reason 自动恢复 none；或热调大上限立即恢复
+curl -X PUT localhost:8000/instances/a/capacity -H 'content-type: application/json' -d '{"max_inflight":0}'
+curl -s localhost:8000/instances | python3 -m json.tool
+
 # 优雅下线：排水 10 秒，在途清零或超时后落地（state: draining -> deregistered / reason: drained）
 curl -X POST localhost:8000/instances/b/drain -H 'content-type: application/json' -d '{"timeout":10}'
 
@@ -157,5 +191,7 @@ uv run pytest tests/test_weight_drain_capacity.py -v -s
 # 权重比例与热调整、权重 0、三种策略的加权择路；
 # 排水在途跑完落地、排水超时落地、重复/并发排水幂等、探测不复活；
 # 容量打满分流、全满快速失败、32 线程不超发；
+# 单实例打满 reason=capacity_full、全满 failure_kind=capacity_exhausted；
+# 容量释放后原因与在途同时归位、上限热调整即时更新、容量原因不掩盖权重0/排水/健康异常；
 # 三种策略下 503/超时都强制换到别的实例。
 ```

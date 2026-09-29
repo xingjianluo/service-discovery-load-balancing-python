@@ -158,7 +158,7 @@ class ServiceRegistry:
                     "instance_id": i.instance_id,
                     "address": i.address,
                     "state": i.state.value,
-                    "reason": i.reason.value,
+                    "reason": i.effective_reason().value,
                     "consecutive_failures": i.consecutive_failures,
                     "inflight": i.inflight,
                     "failure_threshold": self._failure_threshold,

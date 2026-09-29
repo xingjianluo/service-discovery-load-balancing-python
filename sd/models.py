@@ -34,6 +34,8 @@ class FailureKind(enum.Enum):
     RETRYABLE = "retryable"      # 可重试（如 502/503、连接错误）
     TIMEOUT = "timeout"          # 超时，可重试
     NON_RETRYABLE = "non_retryable"  # 不可重试（如 400）
+    CAPACITY_EXHAUSTED = "capacity_exhausted"  # 全部可用实例并发打满：立即失败，
+    # 不换实例重试、不空等；调用方应降级/退避后再试，避免重试风暴
 
 
 @dataclass
@@ -63,6 +65,19 @@ class Instance:
     def has_capacity(self) -> bool:
         """并发容量是否还有余量（max_inflight<=0 表示不限）。"""
         return self.max_inflight <= 0 or self.inflight < self.max_inflight
+
+    def effective_reason(self) -> UnavailableReason:
+        """对外展示的不可用原因。
+
+        健康且可调度但并发打满是瞬态条件，不写回持久 reason（避免在途归还/
+        容量热调整后出现状态漂移）；健康异常、权重 0、排水等持久原因优先展示，
+        绝不与容量原因混淆。
+        """
+        if self.reason != UnavailableReason.NONE:
+            return self.reason
+        if self.is_available() and not self.has_capacity():
+            return UnavailableReason.CAPACITY_FULL
+        return UnavailableReason.NONE
 
 
 @dataclass
